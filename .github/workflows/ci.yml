@@ -75,8 +75,10 @@ jobs:
         run: ./target/release/cicache stop
       - name: Assert the entry was uploaded
         run: |
-          stored=$(jq -r .entries_stored "${RUNNER_TEMP}/cicache/summary.json")
-          echo "entries_stored=$stored"
+          # Small objects ride in the packed entry, larger ones get entries of their own; either
+          # counts as having reached the cache service.
+          stored=$(jq -r '.entries_stored + .packed' "${RUNNER_TEMP}/cicache/summary.json")
+          echo "objects reaching the cache service: $stored"
           [ "$stored" -ge 1 ]
 
   cache-read:

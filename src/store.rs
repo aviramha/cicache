@@ -149,11 +149,14 @@ impl Store {
         let body = pack::encode(&objects, self.pack_limit);
         let size = body.len() as u64;
         match gha.put_scoped(&self.key_prefix, "pack", body).await {
-            Ok(_) => eprintln!(
-                "cicache: packed {} objects ({:.1} MiB) into one entry",
-                objects.len(),
-                size as f64 / (1024.0 * 1024.0)
-            ),
+            Ok(_) => {
+                self.stats.record_packed(objects.len() as u64, size);
+                eprintln!(
+                    "cicache: packed {} objects ({:.1} MiB) into one entry",
+                    objects.len(),
+                    size as f64 / (1024.0 * 1024.0)
+                )
+            }
             Err(err) => eprintln!("cicache: could not write the pack: {err:#}"),
         }
     }

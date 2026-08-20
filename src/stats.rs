@@ -22,6 +22,9 @@ pub struct Summary {
     pub bytes_from_network: u64,
     pub bytes_uploaded: u64,
     pub entries_stored: u64,
+    /// Objects carried in the packed entry rather than stored individually.
+    pub packed: u64,
+    pub packed_bytes: u64,
     pub uploads_failed: u64,
     /// Wall-clock spent fetching upstream on misses, i.e. the time a full cache would have saved.
     pub upstream_millis: u64,
@@ -39,6 +42,8 @@ pub struct Stats {
     bytes_from_network: AtomicU64,
     bytes_uploaded: AtomicU64,
     entries_stored: AtomicU64,
+    packed: AtomicU64,
+    packed_bytes: AtomicU64,
     uploads_failed: AtomicU64,
     upstream_millis: AtomicU64,
     log: Mutex<Option<std::fs::File>>,
@@ -127,6 +132,11 @@ impl Stats {
         }
     }
 
+    pub fn record_packed(&self, objects: u64, bytes: u64) {
+        self.packed.store(objects, Ordering::Relaxed);
+        self.packed_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     pub fn summary(&self) -> Summary {
         Summary {
             requests: self.requests.load(Ordering::Relaxed),
@@ -139,6 +149,8 @@ impl Stats {
             bytes_from_network: self.bytes_from_network.load(Ordering::Relaxed),
             bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
             entries_stored: self.entries_stored.load(Ordering::Relaxed),
+            packed: self.packed.load(Ordering::Relaxed),
+            packed_bytes: self.packed_bytes.load(Ordering::Relaxed),
             uploads_failed: self.uploads_failed.load(Ordering::Relaxed),
             upstream_millis: self.upstream_millis.load(Ordering::Relaxed),
         }
@@ -162,7 +174,8 @@ impl Summary {
              \x20 errors             {}\n\
              \x20 served from cache  {}\n\
              \x20 fetched upstream   {}  in {:.1}s\n\
-             \x20 uploaded to cache  {} across {} entries ({} failed)\n",
+             \x20 uploaded to cache  {} across {} entries ({} failed)\n\
+             \x20 packed together    {} across {} objects\n",
             self.requests,
             self.hits,
             self.misses,
@@ -175,6 +188,8 @@ impl Summary {
             human_bytes(self.bytes_uploaded),
             self.entries_stored,
             self.uploads_failed,
+            human_bytes(self.packed_bytes),
+            self.packed,
         )
     }
 }
