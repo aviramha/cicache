@@ -288,7 +288,8 @@ fn install_system_trust(state: &State) {
     if !may_touch_system_trust() {
         return;
     }
-    let output = std::process::Command::new("sudo")
+    let mut command = std::process::Command::new("sudo");
+    command
         .args([
             "-n",
             "security",
@@ -299,15 +300,17 @@ fn install_system_trust(state: &State) {
             "-k",
         ])
         .arg("/Library/Keychains/System.keychain")
-        .arg(&state.ca_path)
-        .output();
-    match output {
-        Ok(out) if out.status.success() => println!("cicache: added the CA to the system keychain"),
-        Ok(out) => println!(
-            "::warning title=cicache::could not add the CA to the system keychain: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+        .arg(&state.ca_path);
+
+    match run_bounded(&mut command, KEYCHAIN_TIMEOUT) {
+        Some(status) if status.success() => {
+            println!("cicache: added the CA to the system keychain")
+        }
+        Some(_) => println!(
+            "::warning title=cicache::could not add the CA to the system keychain; tools that \
+             verify through the platform will not reach the proxy"
         ),
-        Err(err) => println!("::warning title=cicache::could not run security(1): {err}"),
+        None => println!("::warning title=cicache::security(1) did not finish; skipping"),
     }
 }
 
@@ -316,11 +319,14 @@ fn remove_system_trust(state: &State) {
     if !may_touch_system_trust() {
         return;
     }
-    let _ = std::process::Command::new("sudo")
+    let mut remove = std::process::Command::new("sudo");
+    remove
         .args(["-n", "security", "remove-trusted-cert", "-d"])
-        .arg(&state.ca_path)
-        .output();
-    let _ = std::process::Command::new("sudo")
+        .arg(&state.ca_path);
+    run_bounded(&mut remove, KEYCHAIN_TIMEOUT);
+
+    let mut delete = std::process::Command::new("sudo");
+    delete
         .args([
             "-n",
             "security",
@@ -329,8 +335,41 @@ fn remove_system_trust(state: &State) {
             CA_COMMON_NAME,
             "-t",
         ])
-        .arg("/Library/Keychains/System.keychain")
-        .output();
+        .arg("/Library/Keychains/System.keychain");
+    run_bounded(&mut delete, KEYCHAIN_TIMEOUT);
+}
+
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Runs a command to completion, killing it if it outlives `limit`.
+///
+/// `security(1)` can block on an authorization prompt that a runner has no way to answer. Left
+/// unbounded that hangs the teardown step until the job's own timeout fires, which costs far more
+/// than the trust entry is worth — the runner is discarded either way.
+fn run_bounded(
+    command: &mut std::process::Command,
+    limit: Duration,
+) -> Option<std::process::ExitStatus> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => return None,
+        }
+    }
 }
 
 fn curlrc_path() -> Option<PathBuf> {
