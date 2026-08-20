@@ -180,6 +180,7 @@ name = "cicache"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "clap",
  "dashmap",
@@ -191,6 +192,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",

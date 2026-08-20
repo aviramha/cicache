@@ -16,15 +16,12 @@ use rustls::ServerConfig;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Trust bundles shipped by the common Linux distributions used for CI runners, plus Homebrew's
-/// on macOS. The generated CA is appended to whichever one exists so that hosts reached outside
-/// the proxy keep validating against the real roots.
+/// Trust bundles shipped by the Linux distributions used for CI runners. Only consulted if the
+/// platform trust store cannot be read, since reading the store covers macOS and Windows too.
 const SYSTEM_BUNDLES: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
-    "/usr/local/etc/openssl@3/cert.pem",
-    "/opt/homebrew/etc/openssl@3/cert.pem",
 ];
 
 pub struct Ca {
@@ -70,28 +67,49 @@ impl Ca {
         &self.ca_pem
     }
 
-    /// Concatenation of the system roots and the generated CA, for tools whose CA-bundle variable
+    /// Concatenation of the real roots and the generated CA, for tools whose CA-bundle variable
     /// replaces the trust store rather than extending it.
-    pub fn trust_bundle(&self) -> String {
+    ///
+    /// Emitting the CA on its own would be actively harmful: those variables would then point at a
+    /// bundle with no real roots, breaking every connection that bypasses the proxy.
+    pub fn trust_bundle(&self) -> Result<String> {
         let mut bundle = String::new();
-        for path in SYSTEM_BUNDLES {
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                bundle.push_str(&contents);
-                if !bundle.ends_with('\n') {
-                    bundle.push('\n');
+
+        // The platform store is authoritative and works the same on Linux, macOS and Windows.
+        let native = rustls_native_certs::load_native_certs();
+        for cert in &native.certs {
+            bundle.push_str(&pem_encode(cert));
+        }
+
+        if bundle.is_empty() {
+            for path in SYSTEM_BUNDLES {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    bundle.push_str(&contents);
+                    if !bundle.ends_with('\n') {
+                        bundle.push('\n');
+                    }
+                    break;
                 }
-                break;
             }
         }
+
+        if bundle.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no system trust roots found ({} error(s) reading the platform store); refusing \
+                 to emit a bundle containing only the generated CA",
+                native.errors.len()
+            ));
+        }
+
         bundle.push_str(&self.ca_pem);
-        bundle
+        Ok(bundle)
     }
 
     pub fn write_files(&self, dir: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
         let ca_path = dir.join("ca.pem");
         let bundle_path = dir.join("ca-bundle.pem");
         std::fs::write(&ca_path, self.ca_pem()).context("writing ca.pem")?;
-        std::fs::write(&bundle_path, self.trust_bundle()).context("writing ca-bundle.pem")?;
+        std::fs::write(&bundle_path, self.trust_bundle()?).context("writing ca-bundle.pem")?;
         Ok((ca_path, bundle_path))
     }
 
@@ -137,4 +155,17 @@ impl Ca {
         self.configs.insert(host.to_string(), config.clone());
         Ok(config)
     }
+}
+
+/// DER certificate as a PEM block.
+fn pem_encode(cert: &rustls::pki_types::CertificateDer<'_>) -> String {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 output is ASCII"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
