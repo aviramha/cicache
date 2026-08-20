@@ -128,7 +128,7 @@ impl GhaCache {
             if !self.exhausted.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "cicache: the cache service is rate limiting this job; giving up on it for \
-                     the rest of the run. Raise --min-size so fewer, larger objects are stored."
+                     the rest of the run."
                 );
             }
             return Err(anyhow!("{method} returned {status}: {text}"));
@@ -146,13 +146,39 @@ impl GhaCache {
 
     /// Fetches a previously stored object, or `None` if no entry matches.
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        self.fetch(key, &[]).await
+    }
+
+    /// Fetches the newest manifest written under `prefix`.
+    ///
+    /// Entries are immutable, so each job writes its own manifest under a unique key and the
+    /// newest is found by prefix rather than by overwriting one well-known key.
+    pub async fn get_index(&self, prefix: &str) -> Result<Option<Bytes>> {
+        let restore = index_prefix(prefix);
+        self.fetch(&restore, &[&restore]).await
+    }
+
+    /// Writes a manifest. The key carries the run identity so concurrent jobs do not collide on
+    /// an entry that cannot be rewritten.
+    pub async fn put_index(&self, prefix: &str, body: Bytes) -> Result<bool> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let run = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into());
+        let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "job".into());
+        let key = format!("{}{stamp}-{run}-{job}", index_prefix(prefix));
+        self.put(&key, body).await
+    }
+
+    async fn fetch(&self, key: &str, restore_keys: &[&str]) -> Result<Option<Bytes>> {
         if self.is_exhausted() {
             return Ok(None);
         }
         let req = DownloadRequest {
             key,
             version: &self.version,
-            restore_keys: vec![],
+            restore_keys: restore_keys.to_vec(),
         };
         let resp: DownloadResponse = self.rpc("GetCacheEntryDownloadURL", &req).await?;
         if !resp.ok || resp.signed_download_url.is_empty() {
@@ -208,6 +234,11 @@ impl GhaCache {
         let finalize: FinalizeUploadResponse = self.rpc("FinalizeCacheEntryUpload", &req).await?;
         Ok(finalize.ok)
     }
+}
+
+/// Common prefix for every manifest, so the newest can be found by prefix match.
+fn index_prefix(prefix: &str) -> String {
+    format!("{prefix}-index-")
 }
 
 fn sha_hex(bytes: &[u8]) -> String {

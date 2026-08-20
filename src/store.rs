@@ -3,6 +3,12 @@
 //!
 //! Uploads are queued and drained by the teardown step so that a store never delays the response
 //! being handed back to the client.
+//!
+//! Which keys the service holds is read once, as a manifest, at the start of the job. The cache
+//! API is rate limited per job and a build makes thousands of requests, so asking the service
+//! about each one in turn exhausts the limit long before the build finishes and leaves the cache
+//! unusable. Consulting a local set instead means the service is only called for keys it actually
+//! has.
 
 use crate::gha::GhaCache;
 use crate::stats::Stats;
@@ -22,6 +28,11 @@ pub struct Store {
     remote_misses: DashSet<String>,
     /// Keys already queued for upload, so a URL fetched twice is only stored once.
     queued: DashSet<String>,
+    /// Keys the service is known to hold: the manifest read at startup, plus the uploads this job
+    /// confirmed. A key absent from this set is never looked up.
+    index: Arc<DashSet<String>>,
+    /// Prefix the manifest is filed under.
+    key_prefix: String,
     tx: Mutex<Option<mpsc::UnboundedSender<(String, Bytes)>>>,
     uploader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -32,6 +43,7 @@ impl Store {
         gha: Option<Arc<GhaCache>>,
         stats: Arc<Stats>,
         concurrency: usize,
+        key_prefix: String,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let store = Arc::new(Self {
@@ -40,16 +52,58 @@ impl Store {
             stats: stats.clone(),
             remote_misses: DashSet::new(),
             queued: DashSet::new(),
+            index: Arc::new(DashSet::new()),
+            key_prefix,
             tx: Mutex::new(Some(tx)),
             uploader: Mutex::new(None),
         });
-        let handle = tokio::spawn(upload_loop(rx, gha, stats, concurrency));
+        let handle = tokio::spawn(upload_loop(
+            rx,
+            gha,
+            stats,
+            concurrency,
+            store.index.clone(),
+        ));
         *store.uploader.lock().unwrap() = Some(handle);
         store
     }
 
     fn path(&self, key: &str) -> PathBuf {
         self.objects.join(key)
+    }
+
+    /// Loads the manifest. One call, before any traffic is served.
+    pub async fn load_index(&self) {
+        let Some(gha) = self.gha.as_ref() else { return };
+        match gha.get_index(&self.key_prefix).await {
+            Ok(Some(raw)) => {
+                let text = String::from_utf8_lossy(&raw);
+                for key in text.lines().filter(|line| !line.trim().is_empty()) {
+                    self.index.insert(key.to_string());
+                }
+                eprintln!("cicache: cache holds {} objects", self.index.len());
+            }
+            Ok(None) => eprintln!("cicache: no manifest yet; this run will build one"),
+            Err(err) => eprintln!("cicache: could not read the manifest: {err:#}"),
+        }
+    }
+
+    /// Writes back the manifest: what was already known, plus what this job added. Merging rather
+    /// than replacing keeps concurrent jobs from dropping each other's entries.
+    async fn save_index(&self) {
+        let Some(gha) = self.gha.as_ref() else { return };
+        if self.stats.summary().entries_stored == 0 {
+            return;
+        }
+        let mut keys: Vec<String> = self.index.iter().map(|k| k.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        let body = Bytes::from(keys.join("\n"));
+        match gha.put_index(&self.key_prefix, body).await {
+            Ok(true) => eprintln!("cicache: manifest now lists {} objects", keys.len()),
+            Ok(false) => {}
+            Err(err) => eprintln!("cicache: could not write the manifest: {err:#}"),
+        }
     }
 
     pub async fn get(&self, key: &str) -> Option<Bytes> {
@@ -59,6 +113,11 @@ impl Store {
         }
 
         let gha = self.gha.as_ref()?;
+        // The manifest is the whole point: a key it does not list cannot be in the service, so
+        // there is nothing to ask about.
+        if !self.index.contains(key) {
+            return None;
+        }
         if self.remote_misses.contains(key) {
             return None;
         }
@@ -98,6 +157,9 @@ impl Store {
         if let Some(handle) = handle {
             let _ = handle.await;
         }
+        // Written after the objects, so a manifest never advertises something that failed to
+        // upload.
+        self.save_index().await;
         let summary = self.stats.summary();
         if summary.entries_stored > 0 || summary.uploads_failed > 0 {
             eprintln!(
@@ -113,6 +175,7 @@ async fn upload_loop(
     gha: Option<Arc<GhaCache>>,
     stats: Arc<Stats>,
     concurrency: usize,
+    index: Arc<DashSet<String>>,
 ) {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
@@ -123,13 +186,19 @@ async fn upload_loop(
             break;
         };
         let stats = stats.clone();
+        let index = index.clone();
         tasks.spawn(async move {
             let len = bytes.len() as u64;
             match gha.put(&key, bytes).await {
                 // A declined reservation means a concurrent job wrote the same key first, which is
-                // the outcome we wanted anyway.
-                Ok(true) => stats.record_upload(len, true),
-                Ok(false) => {}
+                // the outcome we wanted anyway, so it belongs in the manifest either way.
+                Ok(true) => {
+                    stats.record_upload(len, true);
+                    index.insert(key);
+                }
+                Ok(false) => {
+                    index.insert(key);
+                }
                 Err(err) => {
                     eprintln!("cicache: storing {key} failed: {err:#}");
                     stats.record_upload(0, false);

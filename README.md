@@ -95,6 +95,15 @@ ends of the transfer land on the job's critical path.
 Reads go to a local directory first, so a URL fetched twice in one job costs one round trip.
 Writes are queued and drained by `stop`.
 
+**Which keys the service holds is read once, as a manifest, at the start of the job.** The cache
+API is rate limited per job, and a build makes thousands of requests; asking the service about
+each one in turn exhausts the limit long before the build finishes and leaves the cache unusable
+for the rest of the run. Consulting a local set instead means the service is only called for keys
+it actually has, taking calls per job from roughly one-per-request down to one plus the number of
+hits and stores. Entries are immutable, so each job files its own manifest under a unique key and
+the newest is found by prefix; a job writes back what it read plus what it confirmed storing, so
+concurrent jobs do not drop each other's entries.
+
 Three constraints come from the cache service and cannot be designed away:
 
 - **10 GB per repository, with repository-wide LRU eviction.** A cache of everything will fill

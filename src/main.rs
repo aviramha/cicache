@@ -474,7 +474,9 @@ async fn run(args: ProxyArgs) -> Result<()> {
         gha,
         stats.clone(),
         args.upload_concurrency,
+        args.key_prefix.clone(),
     );
+    store.load_index().await;
 
     let policy = policy::Policy {
         min_size: args.min_size,
