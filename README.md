@@ -21,13 +21,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Start cache proxy
-        uses: aviramha/cicache@v1
+        uses: aviramha/cicache@v0
 
       # ... the rest of the job, unchanged ...
 
       - name: Stop cache proxy
         if: always()
-        uses: aviramha/cicache/cleanup@v1
+        uses: aviramha/cicache/cleanup@v0
 ```
 
 The action installs a prebuilt binary (Linux and macOS, x86_64 and arm64) and starts the proxy.
@@ -177,11 +177,11 @@ PASS (not a GET)                        0 B    242ms  POST https://github.com/o/
 
 ## Reusing it from another repository
 
-The action is versioned by a moving major tag, so a consuming workflow pins `@v1` and picks up
+The action is versioned by a moving major tag, so a consuming workflow pins `@v0` and picks up
 patches automatically:
 
 ```yaml
-- uses: aviramha/cicache@v1
+- uses: aviramha/cicache@v0
   with:
     # Rust builds pull large artifacts and few small ones; a higher floor keeps the entry
     # count down and leaves more of the 10 GB budget for the build caches.
