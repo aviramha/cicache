@@ -592,7 +592,7 @@ async fn stop(args: StopArgs) -> Result<()> {
             println!("{}", summary.render());
             // Any upload that did not land means a later job re-downloads that object, so the
             // reason belongs in the log whether some of them succeeded or none of them did.
-            if summary.stored > 0 && summary.entries_stored == 0 {
+            if summary.stored > 0 && summary.entries_stored == 0 && summary.packed == 0 {
                 println!(
                     "::warning title=cicache::{} responses were eligible to cache but none \
                      reached the cache service; later jobs will start cold.",
