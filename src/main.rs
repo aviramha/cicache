@@ -567,11 +567,20 @@ async fn stop(args: StopArgs) -> Result<()> {
         Ok(contents) => {
             let summary: stats::Summary = serde_json::from_str(&contents)?;
             println!("{}", summary.render());
+            // Any upload that did not land means a later job re-downloads that object, so the
+            // reason belongs in the log whether some of them succeeded or none of them did.
             if summary.stored > 0 && summary.entries_stored == 0 {
                 println!(
                     "::warning title=cicache::{} responses were eligible to cache but none \
                      reached the cache service; later jobs will start cold.",
                     summary.stored
+                );
+                print_daemon_log(&dir);
+            } else if summary.uploads_failed > 0 {
+                println!(
+                    "::warning title=cicache::{} of {} objects failed to reach the cache service.",
+                    summary.uploads_failed,
+                    summary.uploads_failed + summary.entries_stored
                 );
                 print_daemon_log(&dir);
             }
