@@ -149,25 +149,20 @@ impl GhaCache {
         self.fetch(key, &[]).await
     }
 
-    /// Fetches the newest manifest written under `prefix`.
-    ///
-    /// Entries are immutable, so each job writes its own manifest under a unique key and the
-    /// newest is found by prefix rather than by overwriting one well-known key.
+    /// Fetches the newest manifest this job wrote on an earlier run.
     pub async fn get_index(&self, prefix: &str) -> Result<Option<Bytes>> {
         let restore = index_prefix(prefix);
         self.fetch(&restore, &[&restore]).await
     }
 
-    /// Writes a manifest. The key carries the run identity so concurrent jobs do not collide on
-    /// an entry that cannot be rewritten.
+    /// Writes this job's manifest, under a key unique to the run so nothing is overwritten.
     pub async fn put_index(&self, prefix: &str, body: Bytes) -> Result<bool> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
         let run = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into());
-        let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "job".into());
-        let key = format!("{}{stamp}-{run}-{job}", index_prefix(prefix));
+        let key = format!("{}{stamp}-{run}", index_prefix(prefix));
         self.put(&key, body).await
     }
 
@@ -254,9 +249,17 @@ fn is_already_exists(err: &anyhow::Error) -> bool {
     text.contains("409") || text.contains("already_exists")
 }
 
-/// Common prefix for every manifest, so the newest can be found by prefix match.
+/// Prefix for this job's manifests, so a prefix match finds the newest of its own.
+///
+/// The manifest is scoped to the job rather than shared across the run. Jobs run concurrently and
+/// all start from the same manifest, so a shared one would end up holding only whatever the
+/// last-finishing job wrote and would hide every other job's objects. A job fetches much the same
+/// artifacts from run to run, so its own history is what it needs.
 fn index_prefix(prefix: &str) -> String {
-    format!("{prefix}-index-")
+    let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "job".into());
+    let os = std::env::var("RUNNER_OS").unwrap_or_else(|_| "os".into());
+    let arch = std::env::var("RUNNER_ARCH").unwrap_or_else(|_| "arch".into());
+    format!("{prefix}-index-{job}-{os}-{arch}-")
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
