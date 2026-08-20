@@ -212,7 +212,14 @@ impl GhaCache {
             key,
             version: &self.version,
         };
-        let create: CreateResponse = self.rpc("CreateCacheEntry", &req).await?;
+        let create: CreateResponse = match self.rpc("CreateCacheEntry", &req).await {
+            Ok(create) => create,
+            // Jobs in a run fetch the same artifacts concurrently, so two of them racing to store
+            // one key is routine. Whichever loses is looking at an entry that exists, which is the
+            // outcome it wanted.
+            Err(err) if is_already_exists(&err) => return Ok(false),
+            Err(err) => return Err(err),
+        };
         if !create.ok || create.signed_upload_url.is_empty() {
             return Ok(false);
         }
@@ -239,6 +246,12 @@ impl GhaCache {
         let finalize: FinalizeUploadResponse = self.rpc("FinalizeCacheEntryUpload", &req).await?;
         Ok(finalize.ok)
     }
+}
+
+/// Whether a reservation was refused because the entry is already there.
+fn is_already_exists(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("409") || text.contains("already_exists")
 }
 
 /// Common prefix for every manifest, so the newest can be found by prefix match.
