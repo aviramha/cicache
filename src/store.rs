@@ -15,6 +15,7 @@ use crate::stats::Stats;
 use bytes::Bytes;
 use dashmap::DashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -33,6 +34,8 @@ pub struct Store {
     index: Arc<DashSet<String>>,
     /// Prefix the manifest is filed under.
     key_prefix: String,
+    /// Whether anything was learned this job that the manifest does not already record.
+    index_dirty: Arc<AtomicBool>,
     tx: Mutex<Option<mpsc::UnboundedSender<(String, Bytes)>>>,
     uploader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -53,6 +56,7 @@ impl Store {
             remote_misses: DashSet::new(),
             queued: DashSet::new(),
             index: Arc::new(DashSet::new()),
+            index_dirty: Arc::new(AtomicBool::new(false)),
             key_prefix,
             tx: Mutex::new(Some(tx)),
             uploader: Mutex::new(None),
@@ -63,6 +67,7 @@ impl Store {
             stats,
             concurrency,
             store.index.clone(),
+            store.index_dirty.clone(),
         ));
         *store.uploader.lock().unwrap() = Some(handle);
         store
@@ -92,7 +97,11 @@ impl Store {
     /// than replacing keeps concurrent jobs from dropping each other's entries.
     async fn save_index(&self) {
         let Some(gha) = self.gha.as_ref() else { return };
-        if self.stats.summary().entries_stored == 0 {
+        // Objects a concurrent job stored first are in the cache just as surely as the ones this
+        // job uploaded, and they are exactly what a later run needs told about. Keying this off
+        // successful uploads alone meant a job that stored nothing new never wrote a manifest, so
+        // the next run found none, looked nothing up, and stored nothing new either.
+        if !self.index_dirty.load(Ordering::Relaxed) {
             return;
         }
         let mut keys: Vec<String> = self.index.iter().map(|k| k.clone()).collect();
@@ -176,6 +185,7 @@ async fn upload_loop(
     stats: Arc<Stats>,
     concurrency: usize,
     index: Arc<DashSet<String>>,
+    index_dirty: Arc<AtomicBool>,
 ) {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
@@ -187,6 +197,7 @@ async fn upload_loop(
         };
         let stats = stats.clone();
         let index = index.clone();
+        let index_dirty = index_dirty.clone();
         tasks.spawn(async move {
             let len = bytes.len() as u64;
             match gha.put(&key, bytes).await {
@@ -194,10 +205,14 @@ async fn upload_loop(
                 // the outcome we wanted anyway, so it belongs in the manifest either way.
                 Ok(true) => {
                     stats.record_upload(len, true);
-                    index.insert(key);
+                    if index.insert(key) {
+                        index_dirty.store(true, Ordering::Relaxed);
+                    }
                 }
                 Ok(false) => {
-                    index.insert(key);
+                    if index.insert(key) {
+                        index_dirty.store(true, Ordering::Relaxed);
+                    }
                 }
                 Err(err) => {
                     eprintln!("cicache: storing {key} failed: {err:#}");
