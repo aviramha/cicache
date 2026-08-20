@@ -11,6 +11,7 @@
 //! has.
 
 use crate::gha::GhaCache;
+use crate::pack;
 use crate::stats::Stats;
 use bytes::Bytes;
 use dashmap::DashSet;
@@ -36,6 +37,14 @@ pub struct Store {
     key_prefix: String,
     /// Whether anything was learned this job that the manifest does not already record.
     index_dirty: Arc<AtomicBool>,
+    /// Objects below this size travel in the pack rather than as entries of their own.
+    pack_threshold: u64,
+    /// Ceiling on the pack, so a job cannot fill the repository's cache budget by itself.
+    pack_limit: u64,
+    /// Keys held in the pack: those unpacked at startup plus those added this job.
+    packed: DashSet<String>,
+    /// Whether the pack gained anything worth writing back.
+    pack_dirty: AtomicBool,
     tx: Mutex<Option<mpsc::UnboundedSender<(String, Bytes)>>>,
     uploader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -47,6 +56,8 @@ impl Store {
         stats: Arc<Stats>,
         concurrency: usize,
         key_prefix: String,
+        pack_threshold: u64,
+        pack_limit: u64,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let store = Arc::new(Self {
@@ -57,6 +68,10 @@ impl Store {
             queued: DashSet::new(),
             index: Arc::new(DashSet::new()),
             index_dirty: Arc::new(AtomicBool::new(false)),
+            pack_threshold,
+            pack_limit,
+            packed: DashSet::new(),
+            pack_dirty: AtomicBool::new(false),
             key_prefix,
             tx: Mutex::new(Some(tx)),
             uploader: Mutex::new(None),
@@ -77,10 +92,76 @@ impl Store {
         self.objects.join(key)
     }
 
+    /// Unpacks this job's small objects onto local disk, where the ordinary read path finds them.
+    /// One call, whatever the number of objects inside.
+    pub async fn load_pack(&self) {
+        let Some(gha) = self.gha.as_ref() else { return };
+        let raw = match gha.get_scoped(&self.key_prefix, "pack").await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return,
+            Err(err) => {
+                eprintln!("cicache: could not read the pack: {err:#}");
+                return;
+            }
+        };
+
+        let objects = match pack::decode(&raw) {
+            Ok(objects) => objects,
+            Err(err) => {
+                eprintln!("cicache: discarding an unreadable pack: {err:#}");
+                return;
+            }
+        };
+
+        let mut bytes = 0u64;
+        for (key, body) in &objects {
+            if tokio::fs::write(self.path(key), body).await.is_ok() {
+                bytes += body.len() as u64;
+                self.packed.insert(key.clone());
+            }
+        }
+        eprintln!(
+            "cicache: unpacked {} objects ({:.1} MiB) from the pack",
+            objects.len(),
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    /// Rebuilds the pack from what is on local disk and stores it as a single entry.
+    async fn save_pack(&self) {
+        let Some(gha) = self.gha.as_ref() else { return };
+        if !self.pack_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut objects = Vec::new();
+        let mut keys: Vec<String> = self.packed.iter().map(|k| k.clone()).collect();
+        keys.sort();
+        for key in keys {
+            if let Ok(body) = tokio::fs::read(self.path(&key)).await {
+                objects.push((key, Bytes::from(body)));
+            }
+        }
+        if objects.is_empty() {
+            return;
+        }
+
+        let body = pack::encode(&objects, self.pack_limit);
+        let size = body.len() as u64;
+        match gha.put_scoped(&self.key_prefix, "pack", body).await {
+            Ok(_) => eprintln!(
+                "cicache: packed {} objects ({:.1} MiB) into one entry",
+                objects.len(),
+                size as f64 / (1024.0 * 1024.0)
+            ),
+            Err(err) => eprintln!("cicache: could not write the pack: {err:#}"),
+        }
+    }
+
     /// Loads the manifest. One call, before any traffic is served.
     pub async fn load_index(&self) {
         let Some(gha) = self.gha.as_ref() else { return };
-        match gha.get_index(&self.key_prefix).await {
+        match gha.get_scoped(&self.key_prefix, "index").await {
             Ok(Some(raw)) => {
                 let text = String::from_utf8_lossy(&raw);
                 for key in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -108,7 +189,7 @@ impl Store {
         keys.sort();
         keys.dedup();
         let body = Bytes::from(keys.join("\n"));
-        match gha.put_index(&self.key_prefix, body).await {
+        match gha.put_scoped(&self.key_prefix, "index", body).await {
             Ok(true) => eprintln!("cicache: manifest now lists {} objects", keys.len()),
             Ok(false) => {}
             Err(err) => eprintln!("cicache: could not write the manifest: {err:#}"),
@@ -152,6 +233,16 @@ impl Store {
             return;
         }
         let _ = tokio::fs::write(self.path(&key), &bytes).await;
+
+        // Below the threshold an entry of its own costs more in calls to a rate limited API than
+        // the object is worth; it rides in the pack instead.
+        if (bytes.len() as u64) < self.pack_threshold {
+            if self.packed.insert(key) {
+                self.pack_dirty.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+
         let sender = self.tx.lock().unwrap().clone();
         if let Some(sender) = sender {
             let _ = sender.send((key, bytes));
@@ -166,9 +257,9 @@ impl Store {
         if let Some(handle) = handle {
             let _ = handle.await;
         }
-        // Written after the objects, so a manifest never advertises something that failed to
-        // upload.
+        // Both written after the objects, so neither advertises something that failed to upload.
         self.save_index().await;
+        self.save_pack().await;
         let summary = self.stats.summary();
         if summary.entries_stored > 0 || summary.uploads_failed > 0 {
             eprintln!(

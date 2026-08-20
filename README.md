@@ -95,6 +95,13 @@ ends of the transfer land on the job's critical path.
 Reads go to a local directory first, so a URL fetched twice in one job costs one round trip.
 Writes are queued and drained by `stop`.
 
+**Objects below `--pack-threshold` share a single entry.** The service charges per entry — two
+calls to store one object, against a limit shared by every job running at once — so the number of
+objects matters far more than their size. Measured on a Rust build: objects of 1 MiB and up are 17
+of the 1380 fetched and 69% of the bytes, while the remaining 1363 are only 31%. Storing those
+individually exhausts the limit and most of them fail; collected into one entry they cost two
+calls. Large objects stay separate, where they also deduplicate across every job and run.
+
 **Which keys the service holds is read once, as a manifest, at the start of the job.** The cache
 API is rate limited per job, and a build makes thousands of requests; asking the service about
 each one in turn exhausts the limit long before the build finishes and leaves the cache unusable

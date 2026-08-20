@@ -17,6 +17,9 @@ inputs:
   bypass:
     description: 'Comma-separated extra hosts to forward untouched'
     default: ''
+  pack-threshold:
+    description: 'Objects below this size share one packed entry instead of costing an entry each'
+    default: '1048576'
   key-prefix:
     description: 'Cache key prefix. Change it to invalidate everything previously stored'
     default: 'cicache-v1'
@@ -73,6 +76,7 @@ runs:
       run: |
         set -euo pipefail
         args=(start --min-size '${{ inputs.min-size }}' --key-prefix '${{ inputs.key-prefix }}')
+        args+=(--pack-threshold '${{ inputs.pack-threshold }}')
         if [ '${{ inputs.cache-all }}' = 'true' ]; then
           args+=(--cache-all)
         fi

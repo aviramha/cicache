@@ -8,6 +8,7 @@
 mod ca;
 mod entry;
 mod gha;
+mod pack;
 mod policy;
 mod proxy;
 mod stats;
@@ -88,6 +89,16 @@ struct ProxyArgs {
     /// Concurrent uploads to the cache service.
     #[arg(long, default_value_t = 8)]
     upload_concurrency: usize,
+
+    /// Objects smaller than this travel together in one packed entry rather than costing an
+    /// entry each. The cache API is rate limited per run, so the number of entries matters more
+    /// than their size.
+    #[arg(long, default_value_t = 1024 * 1024)]
+    pack_threshold: u64,
+
+    /// Ceiling on the packed entry, so one job cannot fill the repository's cache budget.
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    pack_limit: u64,
 
     /// Prefix for cache keys. Change it to invalidate everything previously stored.
     #[arg(long, default_value = "cicache-v1")]
@@ -475,8 +486,11 @@ async fn run(args: ProxyArgs) -> Result<()> {
         stats.clone(),
         args.upload_concurrency,
         args.key_prefix.clone(),
+        args.pack_threshold,
+        args.pack_limit,
     );
     store.load_index().await;
+    store.load_pack().await;
 
     let policy = policy::Policy {
         min_size: args.min_size,
@@ -632,6 +646,10 @@ impl ProxyArgs {
             self.upload_concurrency.to_string(),
             "--key-prefix".into(),
             self.key_prefix.clone(),
+            "--pack-threshold".into(),
+            self.pack_threshold.to_string(),
+            "--pack-limit".into(),
+            self.pack_limit.to_string(),
         ];
         if self.cache_all {
             args.push("--cache-all".into());
