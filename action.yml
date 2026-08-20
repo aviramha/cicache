@@ -27,6 +27,22 @@ inputs:
 runs:
   using: composite
   steps:
+    # The cache-service variables are handed to JavaScript actions only; `run:` steps never see
+    # them. This re-exports them so the proxy, which is a plain process, can reach the service.
+    - name: Expose the Actions cache service
+      uses: actions/github-script@v7
+      with:
+        script: |
+          for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+            const value = process.env[name]
+            if (!value) {
+              core.setFailed(`${name} is not available; cicache cannot reach the cache service`)
+              return
+            }
+            if (name.endsWith('TOKEN')) core.setSecret(value)
+            core.exportVariable(name, value)
+          }
+
     - name: Install cicache
       shell: bash
       run: |

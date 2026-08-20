@@ -187,7 +187,18 @@ fn start(args: ProxyArgs) -> Result<()> {
         state.ca_path.display()
     );
     if std::env::var_os("ACTIONS_RESULTS_URL").is_none() {
-        println!("cicache: no Actions cache service in the environment; local cache only");
+        // Inside Actions this is almost always the missing re-export rather than a deliberate
+        // local-only run: GitHub hands the cache-service variables to JavaScript actions and
+        // withholds them from `run:` steps.
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            println!(
+                "::warning title=cicache::ACTIONS_RESULTS_URL is not set, so nothing will be \
+                 stored beyond this job. Export the cache-service variables before starting the \
+                 proxy, or use the composite action, which does it for you."
+            );
+        } else {
+            println!("cicache: no Actions cache service in the environment; local cache only");
+        }
     }
     Ok(())
 }
@@ -392,13 +403,40 @@ async fn stop(args: StopArgs) -> Result<()> {
         Ok(contents) => {
             let summary: stats::Summary = serde_json::from_str(&contents)?;
             println!("{}", summary.render());
+            if summary.stored > 0 && summary.entries_stored == 0 {
+                println!(
+                    "::warning title=cicache::{} responses were eligible to cache but none \
+                     reached the cache service; later jobs will start cold.",
+                    summary.stored
+                );
+                print_daemon_log(&dir);
+            }
         }
-        Err(_) => println!("cicache: proxy did not report a summary before the timeout"),
+        Err(_) => {
+            println!("cicache: proxy did not report a summary before the timeout");
+            print_daemon_log(&dir);
+        }
     }
 
     let _ = std::fs::remove_dir_all(dir.join("objects"));
     let _ = std::fs::remove_file(state_path);
     Ok(())
+}
+
+/// Surfaces the proxy's own output, which otherwise only reaches the daemon log file.
+fn print_daemon_log(dir: &Path) {
+    let Ok(log) = std::fs::read_to_string(dir.join("daemon.log")) else {
+        return;
+    };
+    let tail: Vec<&str> = log.lines().rev().take(20).collect();
+    if tail.is_empty() {
+        return;
+    }
+    println!("::group::cicache daemon log");
+    for line in tail.into_iter().rev() {
+        println!("{line}");
+    }
+    println!("::endgroup::");
 }
 
 impl ProxyArgs {

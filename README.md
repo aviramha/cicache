@@ -37,6 +37,24 @@ Inputs: `version`, `min-size`, `cache-all`, `bypass`, `key-prefix`, `extra-args`
 with no further changes. `stop` must run with `if: always()` — it is what drains the upload queue,
 so skipping it on failure means the run stored nothing.
 
+Calling the binary from a plain `run:` step needs one extra step first. GitHub hands the
+cache-service variables to JavaScript actions and withholds them from `run:` steps, so without
+this the proxy silently falls back to a cache that lives and dies with the job:
+
+```yaml
+- uses: actions/github-script@v7
+  with:
+    script: |
+      for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+        if (name.endsWith('TOKEN')) core.setSecret(process.env[name])
+        core.exportVariable(name, process.env[name])
+      }
+- run: cicache start
+```
+
+The composite action above already does this. `cicache start` warns when it lands in a job without
+the cache service, and `cicache stop` says so again if a run cached nothing.
+
 ## How it decides what to cache
 
 HTTPS is opaque to a forward proxy, so the tool generates a CA at startup, terminates TLS itself,
