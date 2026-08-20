@@ -1,0 +1,190 @@
+//! Client for the GitHub Actions cache service (the Twirp `v2` API).
+//!
+//! The service is used as a content-addressed key/value store rather than through the usual
+//! archive restore/save dance: every cached object is its own entry, fetched only when a request
+//! actually misses locally. Objects themselves live in Azure Blob Storage; the service hands out
+//! pre-signed URLs for upload and download.
+//!
+//! Entries are immutable once finalized and are scoped to the branch that wrote them. A branch can
+//! read entries written by its base branch and by the repository's default branch, so a cache is
+//! best primed by a run on the default branch.
+
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const SERVICE: &str = "twirp/github.actions.results.api.v1.CacheService";
+
+/// Distinguishes entry layouts. Bumping it makes every previously written entry unreachable, which
+/// is the intended way to invalidate the whole cache after a format change.
+const ENTRY_FORMAT_VERSION: &str = "cicache/entry-v1";
+
+#[derive(Serialize)]
+struct CreateRequest<'a> {
+    key: &'a str,
+    version: &'a str,
+}
+
+#[derive(Deserialize)]
+struct CreateResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    signed_upload_url: String,
+}
+
+#[derive(Serialize)]
+struct FinalizeRequest<'a> {
+    key: &'a str,
+    version: &'a str,
+    /// Proto3 JSON encodes 64-bit integers as strings.
+    size_bytes: String,
+}
+
+#[derive(Deserialize)]
+struct FinalizeResponse {
+    #[serde(default)]
+    ok: bool,
+}
+
+#[derive(Serialize)]
+struct DownloadRequest<'a> {
+    key: &'a str,
+    version: &'a str,
+    restore_keys: Vec<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct DownloadResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    signed_download_url: String,
+}
+
+pub struct GhaCache {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+    version: String,
+}
+
+impl GhaCache {
+    /// Builds a client from the variables the Actions runner exports into every step. Returns
+    /// `None` outside Actions, which leaves the proxy running with only its local disk cache.
+    pub fn from_env() -> Option<Self> {
+        let base = std::env::var("ACTIONS_RESULTS_URL").ok()?;
+        let token = std::env::var("ACTIONS_RUNTIME_TOKEN").ok()?;
+        if base.is_empty() || token.is_empty() {
+            return None;
+        }
+
+        // Requests to the cache service must not loop back through the proxy.
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .ok()?;
+
+        let mut base = base;
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+
+        Some(Self {
+            http,
+            base,
+            token,
+            version: sha_hex(ENTRY_FORMAT_VERSION.as_bytes()),
+        })
+    }
+
+    async fn rpc<Req: Serialize, Res: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        body: &Req,
+    ) -> Result<Res> {
+        let url = format!("{}{}/{}", self.base, SERVICE, method);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("calling {method}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("{method} returned {status}: {text}"));
+        }
+        serde_json::from_str(&text).with_context(|| format!("decoding {method} response: {text}"))
+    }
+
+    /// Fetches a previously stored object, or `None` if no entry matches.
+    pub async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        let req = DownloadRequest {
+            key,
+            version: &self.version,
+            restore_keys: vec![],
+        };
+        let resp: DownloadResponse = self.rpc("GetCacheEntryDownloadURL", &req).await?;
+        if !resp.ok || resp.signed_download_url.is_empty() {
+            return Ok(None);
+        }
+
+        let blob = self
+            .http
+            .get(&resp.signed_download_url)
+            .send()
+            .await
+            .context("downloading cache blob")?;
+        if !blob.status().is_success() {
+            return Ok(None);
+        }
+        Ok(Some(blob.bytes().await.context("reading cache blob")?))
+    }
+
+    /// Stores an object. Returns `false` when the service declines the reservation, which is the
+    /// normal response when a concurrent job already wrote the same key.
+    pub async fn put(&self, key: &str, data: Bytes) -> Result<bool> {
+        let req = CreateRequest {
+            key,
+            version: &self.version,
+        };
+        let create: CreateResponse = self.rpc("CreateCacheEntry", &req).await?;
+        if !create.ok || create.signed_upload_url.is_empty() {
+            return Ok(false);
+        }
+
+        let len = data.len();
+        let upload = self
+            .http
+            .put(&create.signed_upload_url)
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("Content-Length", len.to_string())
+            .body(data)
+            .send()
+            .await
+            .context("uploading cache blob")?;
+        if !upload.status().is_success() {
+            return Err(anyhow!("blob upload returned {}", upload.status()));
+        }
+
+        let req = FinalizeRequest {
+            key,
+            version: &self.version,
+            size_bytes: len.to_string(),
+        };
+        let finalize: FinalizeResponse = self.rpc("FinalizeCacheEntry", &req).await?;
+        Ok(finalize.ok)
+    }
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}

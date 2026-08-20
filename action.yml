@@ -1,0 +1,66 @@
+name: 'cicache'
+description: 'Start a caching HTTP(S) proxy and route the rest of the job through it'
+branding:
+  icon: 'download-cloud'
+  color: 'purple'
+
+inputs:
+  version:
+    description: 'Release tag to install, or "latest"'
+    default: 'latest'
+  min-size:
+    description: 'Smallest response worth a cache entry, in bytes'
+    default: '32768'
+  cache-all:
+    description: 'Store any cacheable response, ignoring freshness headers'
+    default: 'false'
+  bypass:
+    description: 'Comma-separated extra hosts to forward untouched'
+    default: ''
+  key-prefix:
+    description: 'Cache key prefix. Change it to invalidate everything previously stored'
+    default: 'cicache-v1'
+  extra-args:
+    description: 'Additional flags passed to `cicache start`'
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install cicache
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64)          target=x86_64-unknown-linux-musl ;;
+          Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-musl ;;
+          Darwin/arm64)          target=aarch64-apple-darwin ;;
+          Darwin/x86_64)         target=x86_64-apple-darwin ;;
+          *) echo "cicache: no release binary for $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+        esac
+
+        version='${{ inputs.version }}'
+        if [ "$version" = latest ]; then
+          url="https://github.com/aviramha/cicache/releases/latest/download/cicache-${target}.tar.gz"
+        else
+          url="https://github.com/aviramha/cicache/releases/download/${version}/cicache-${target}.tar.gz"
+        fi
+
+        dir="${RUNNER_TEMP}/cicache-bin"
+        mkdir -p "$dir"
+        curl -fsSL --retry 3 --retry-delay 2 "$url" | tar xz -C "$dir"
+        chmod +x "$dir/cicache"
+        echo "CICACHE_BIN=$dir/cicache" >> "$GITHUB_ENV"
+
+    - name: Start proxy
+      shell: bash
+      run: |
+        set -euo pipefail
+        args=(start --min-size '${{ inputs.min-size }}' --key-prefix '${{ inputs.key-prefix }}')
+        if [ '${{ inputs.cache-all }}' = 'true' ]; then
+          args+=(--cache-all)
+        fi
+        if [ -n '${{ inputs.bypass }}' ]; then
+          args+=(--bypass '${{ inputs.bypass }}')
+        fi
+        "${CICACHE_BIN}" "${args[@]}" ${{ inputs.extra-args }}

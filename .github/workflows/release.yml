@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: tar czf cicache-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cicache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cicache-${{ matrix.target }}
+          path: cicache-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: sha256sum dist/*.tar.gz | sed 's|dist/||' > dist/SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes --title "${GITHUB_REF_NAME}"
+      # Consumers pin the action as `aviramha/cicache@v1`, so the major tag has to follow releases.
+      - name: Move the major version tag
+        run: |
+          major="${GITHUB_REF_NAME%%.*}"
+          git tag -f "$major" "${GITHUB_REF_NAME}"
+          git push -f origin "$major"

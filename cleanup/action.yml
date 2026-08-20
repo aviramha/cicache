@@ -1,0 +1,22 @@
+name: 'cicache (cleanup)'
+description: 'Drain pending uploads, print the request log and summary, stop the proxy'
+branding:
+  icon: 'upload-cloud'
+  color: 'purple'
+
+inputs:
+  quiet:
+    description: 'Print only the summary, not the per-request log'
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        args=(stop)
+        if [ '${{ inputs.quiet }}' = 'true' ]; then
+          args+=(--quiet)
+        fi
+        "${CICACHE_BIN:-cicache}" "${args[@]}"
