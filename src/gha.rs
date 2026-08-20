@@ -192,7 +192,12 @@ impl GhaCache {
             .await
             .context("downloading cache blob")?;
         if !blob.status().is_success() {
-            return Ok(None);
+            // The service handed out a URL, so it believes it holds this entry. Treating the
+            // failure as a plain miss would hide it behind an ordinary-looking cache miss.
+            return Err(anyhow!(
+                "download for {key} returned {} despite the service offering it",
+                blob.status()
+            ));
         }
         Ok(Some(blob.bytes().await.context("reading cache blob")?))
     }
