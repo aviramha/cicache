@@ -60,7 +60,9 @@ jobs:
               core.exportVariable(name, process.env[name])
             }
       - name: Start proxy
-        run: ./target/release/cicache start --key-prefix "e2e-${{ github.run_id }}"
+        # Both halves of the round trip share a scope: entries are per-job by default, and these
+        # two are deliberately different jobs.
+        run: ./target/release/cicache start --key-prefix "e2e-${{ github.run_id }}" --scope e2e
       - name: Fetch an artifact twice
         run: |
           set -euo pipefail
@@ -98,7 +100,9 @@ jobs:
               core.exportVariable(name, process.env[name])
             }
       - name: Start proxy with no local state
-        run: ./target/release/cicache start --key-prefix "e2e-${{ github.run_id }}"
+        # Both halves of the round trip share a scope: entries are per-job by default, and these
+        # two are deliberately different jobs.
+        run: ./target/release/cicache start --key-prefix "e2e-${{ github.run_id }}" --scope e2e
       - name: The first fetch in a fresh job must come from the cache service
         run: |
           set -euo pipefail

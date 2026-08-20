@@ -100,6 +100,12 @@ struct ProxyArgs {
     #[arg(long, default_value_t = 512 * 1024 * 1024)]
     pack_limit: u64,
 
+    /// Which entries this run shares, defaulting to this job on this runner. Jobs run
+    /// concurrently and cannot rewrite each other's entries, so they keep separate state unless
+    /// pointed at a common scope on purpose.
+    #[arg(long)]
+    scope: Option<String>,
+
     /// Prefix for cache keys. Change it to invalidate everything previously stored.
     #[arg(long, default_value = "cicache-v1")]
     key_prefix: String,
@@ -484,10 +490,13 @@ async fn run(args: ProxyArgs) -> Result<()> {
         dir.join("objects"),
         gha,
         stats.clone(),
-        args.upload_concurrency,
-        args.key_prefix.clone(),
-        args.pack_threshold,
-        args.pack_limit,
+        store::StoreConfig {
+            key_prefix: args.key_prefix.clone(),
+            scope: args.scope(),
+            pack_threshold: args.pack_threshold,
+            pack_limit: args.pack_limit,
+            concurrency: args.upload_concurrency,
+        },
     );
     store.load_index().await;
     store.load_pack().await;
@@ -629,6 +638,16 @@ fn print_daemon_log(dir: &Path) {
 }
 
 impl ProxyArgs {
+    /// The scope entries are filed under: whatever was asked for, or this job on this runner.
+    fn scope(&self) -> String {
+        self.scope.clone().unwrap_or_else(|| {
+            let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "job".into());
+            let os = std::env::var("RUNNER_OS").unwrap_or_else(|_| "os".into());
+            let arch = std::env::var("RUNNER_ARCH").unwrap_or_else(|_| "arch".into());
+            format!("{job}-{os}-{arch}")
+        })
+    }
+
     /// Rebuilds the flags for the background `run` invocation.
     fn to_run_args(&self, dir: &Path) -> Vec<String> {
         let mut args = vec![
@@ -646,6 +665,8 @@ impl ProxyArgs {
             self.upload_concurrency.to_string(),
             "--key-prefix".into(),
             self.key_prefix.clone(),
+            "--scope".into(),
+            self.scope(),
             "--pack-threshold".into(),
             self.pack_threshold.to_string(),
             "--pack-limit".into(),

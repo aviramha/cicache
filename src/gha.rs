@@ -150,20 +150,26 @@ impl GhaCache {
     }
 
     /// Fetches the newest entry of `kind` this job wrote on an earlier run.
-    pub async fn get_scoped(&self, prefix: &str, kind: &str) -> Result<Option<Bytes>> {
-        let restore = scoped_prefix(prefix, kind);
+    pub async fn get_scoped(&self, prefix: &str, scope: &str, kind: &str) -> Result<Option<Bytes>> {
+        let restore = scoped_prefix(prefix, scope, kind);
         self.fetch(&restore, &[&restore]).await
     }
 
     /// Writes an entry of `kind` for this job, under a key unique to the run so nothing already
     /// stored is overwritten.
-    pub async fn put_scoped(&self, prefix: &str, kind: &str, body: Bytes) -> Result<bool> {
+    pub async fn put_scoped(
+        &self,
+        prefix: &str,
+        scope: &str,
+        kind: &str,
+        body: Bytes,
+    ) -> Result<bool> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
         let run = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into());
-        let key = format!("{}{stamp}-{run}", scoped_prefix(prefix, kind));
+        let key = format!("{}{stamp}-{run}", scoped_prefix(prefix, scope, kind));
         self.put(&key, body).await
     }
 
@@ -250,17 +256,9 @@ fn is_already_exists(err: &anyhow::Error) -> bool {
     text.contains("409") || text.contains("already_exists")
 }
 
-/// Prefix for this job's own entries of a given kind, so a prefix match finds the newest of them.
-///
-/// These are scoped to the job rather than shared across the run. Jobs run concurrently and all
-/// start from the same state, so a shared entry would end up holding only whatever the
-/// last-finishing job wrote and would hide every other job's work. A job fetches much the same
-/// artifacts from run to run, so its own history is what it needs.
-fn scoped_prefix(prefix: &str, kind: &str) -> String {
-    let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "job".into());
-    let os = std::env::var("RUNNER_OS").unwrap_or_else(|_| "os".into());
-    let arch = std::env::var("RUNNER_ARCH").unwrap_or_else(|_| "arch".into());
-    format!("{prefix}-{kind}-{job}-{os}-{arch}-")
+/// Prefix for one scope's entries of a given kind, so a prefix match finds the newest of them.
+fn scoped_prefix(prefix: &str, scope: &str, kind: &str) -> String {
+    format!("{prefix}-{kind}-{scope}-")
 }
 
 fn sha_hex(bytes: &[u8]) -> String {

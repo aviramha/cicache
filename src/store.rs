@@ -21,6 +21,22 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
+/// How a store files what it caches.
+pub struct StoreConfig {
+    /// Prefix every key is filed under. Changing it abandons everything stored before.
+    pub key_prefix: String,
+    /// Which entries this run shares. Defaults to the job itself, since jobs run concurrently and
+    /// would otherwise overwrite each other's state, but jobs fetching the same artifacts can be
+    /// pointed at a common scope.
+    pub scope: String,
+    /// Objects below this size travel in the pack rather than as entries of their own.
+    pub pack_threshold: u64,
+    /// Ceiling on the pack, so a job cannot fill the repository's cache budget by itself.
+    pub pack_limit: u64,
+    /// Concurrent uploads to the cache service.
+    pub concurrency: usize,
+}
+
 pub struct Store {
     objects: PathBuf,
     gha: Option<Arc<GhaCache>>,
@@ -33,14 +49,9 @@ pub struct Store {
     /// Keys the service is known to hold: the manifest read at startup, plus the uploads this job
     /// confirmed. A key absent from this set is never looked up.
     index: Arc<DashSet<String>>,
-    /// Prefix the manifest is filed under.
-    key_prefix: String,
+    config: StoreConfig,
     /// Whether anything was learned this job that the manifest does not already record.
     index_dirty: Arc<AtomicBool>,
-    /// Objects below this size travel in the pack rather than as entries of their own.
-    pack_threshold: u64,
-    /// Ceiling on the pack, so a job cannot fill the repository's cache budget by itself.
-    pack_limit: u64,
     /// Keys held in the pack: those unpacked at startup plus those added this job.
     packed: DashSet<String>,
     /// Whether the pack gained anything worth writing back.
@@ -54,11 +65,9 @@ impl Store {
         objects: PathBuf,
         gha: Option<Arc<GhaCache>>,
         stats: Arc<Stats>,
-        concurrency: usize,
-        key_prefix: String,
-        pack_threshold: u64,
-        pack_limit: u64,
+        config: StoreConfig,
     ) -> Arc<Self> {
+        let concurrency = config.concurrency;
         let (tx, rx) = mpsc::unbounded_channel();
         let store = Arc::new(Self {
             objects,
@@ -68,11 +77,9 @@ impl Store {
             queued: DashSet::new(),
             index: Arc::new(DashSet::new()),
             index_dirty: Arc::new(AtomicBool::new(false)),
-            pack_threshold,
-            pack_limit,
             packed: DashSet::new(),
             pack_dirty: AtomicBool::new(false),
-            key_prefix,
+            config,
             tx: Mutex::new(Some(tx)),
             uploader: Mutex::new(None),
         });
@@ -96,7 +103,10 @@ impl Store {
     /// One call, whatever the number of objects inside.
     pub async fn load_pack(&self) {
         let Some(gha) = self.gha.as_ref() else { return };
-        let raw = match gha.get_scoped(&self.key_prefix, "pack").await {
+        let raw = match gha
+            .get_scoped(&self.config.key_prefix, &self.config.scope, "pack")
+            .await
+        {
             Ok(Some(raw)) => raw,
             Ok(None) => return,
             Err(err) => {
@@ -146,9 +156,12 @@ impl Store {
             return;
         }
 
-        let body = pack::encode(&objects, self.pack_limit);
+        let body = pack::encode(&objects, self.config.pack_limit);
         let size = body.len() as u64;
-        match gha.put_scoped(&self.key_prefix, "pack", body).await {
+        match gha
+            .put_scoped(&self.config.key_prefix, &self.config.scope, "pack", body)
+            .await
+        {
             Ok(_) => {
                 self.stats.record_packed(objects.len() as u64, size);
                 eprintln!(
@@ -164,7 +177,10 @@ impl Store {
     /// Loads the manifest. One call, before any traffic is served.
     pub async fn load_index(&self) {
         let Some(gha) = self.gha.as_ref() else { return };
-        match gha.get_scoped(&self.key_prefix, "index").await {
+        match gha
+            .get_scoped(&self.config.key_prefix, &self.config.scope, "index")
+            .await
+        {
             Ok(Some(raw)) => {
                 let text = String::from_utf8_lossy(&raw);
                 for key in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -192,7 +208,10 @@ impl Store {
         keys.sort();
         keys.dedup();
         let body = Bytes::from(keys.join("\n"));
-        match gha.put_scoped(&self.key_prefix, "index", body).await {
+        match gha
+            .put_scoped(&self.config.key_prefix, &self.config.scope, "index", body)
+            .await
+        {
             Ok(true) => eprintln!("cicache: manifest now lists {} objects", keys.len()),
             Ok(false) => {}
             Err(err) => eprintln!("cicache: could not write the manifest: {err:#}"),
@@ -239,7 +258,7 @@ impl Store {
 
         // Below the threshold an entry of its own costs more in calls to a rate limited API than
         // the object is worth; it rides in the pack instead.
-        if (bytes.len() as u64) < self.pack_threshold {
+        if (bytes.len() as u64) < self.config.pack_threshold {
             if self.packed.insert(key) {
                 self.pack_dirty.store(true, Ordering::Relaxed);
             }

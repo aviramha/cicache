@@ -20,6 +20,9 @@ inputs:
   pack-threshold:
     description: 'Objects below this size share one packed entry instead of costing an entry each'
     default: '1048576'
+  scope:
+    description: 'Which entries this job shares. Defaults to the job on its runner; give several jobs the same value to share one cache between them'
+    default: ''
   key-prefix:
     description: 'Cache key prefix. Change it to invalidate everything previously stored'
     default: 'cicache-v1'
@@ -77,6 +80,9 @@ runs:
         set -euo pipefail
         args=(start --min-size '${{ inputs.min-size }}' --key-prefix '${{ inputs.key-prefix }}')
         args+=(--pack-threshold '${{ inputs.pack-threshold }}')
+        if [ -n '${{ inputs.scope }}' ]; then
+          args+=(--scope '${{ inputs.scope }}')
+        fi
         if [ '${{ inputs.cache-all }}' = 'true' ]; then
           args+=(--cache-all)
         fi
