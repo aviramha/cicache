@@ -22,9 +22,11 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             musl: true
+          # Both darwin targets build on arm64: the Intel runner image is retired, and Apple's
+          # toolchain cross-compiles x86_64 from Apple silicon.
           - runner: macos-latest
             target: aarch64-apple-darwin
-          - runner: macos-13
+          - runner: macos-latest
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
