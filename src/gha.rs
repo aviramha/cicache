@@ -35,7 +35,7 @@ struct CreateResponse {
 }
 
 #[derive(Serialize)]
-struct FinalizeRequest<'a> {
+struct FinalizeUploadRequest<'a> {
     key: &'a str,
     version: &'a str,
     /// Proto3 JSON encodes 64-bit integers as strings.
@@ -43,7 +43,7 @@ struct FinalizeRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct FinalizeResponse {
+struct FinalizeUploadResponse {
     #[serde(default)]
     ok: bool,
 }
@@ -174,12 +174,12 @@ impl GhaCache {
             return Err(anyhow!("blob upload returned {}", upload.status()));
         }
 
-        let req = FinalizeRequest {
+        let req = FinalizeUploadRequest {
             key,
             version: &self.version,
             size_bytes: len.to_string(),
         };
-        let finalize: FinalizeResponse = self.rpc("FinalizeCacheEntry", &req).await?;
+        let finalize: FinalizeUploadResponse = self.rpc("FinalizeCacheEntryUpload", &req).await?;
         Ok(finalize.ok)
     }
 }
