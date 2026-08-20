@@ -179,6 +179,9 @@ fn start(args: ProxyArgs) -> Result<()> {
     let state = wait_for_state(&state_path, Duration::from_secs(20))
         .with_context(|| format!("proxy did not start; see {}", daemon_log.display()))?;
 
+    if let Err(err) = write_curlrc(&state) {
+        println!("cicache: could not configure curl for Homebrew: {err:#}");
+    }
     export_environment(&state, args.no_github_env)?;
 
     println!(
@@ -255,7 +258,63 @@ fn environment(state: &State) -> Vec<(String, String)> {
     for name in ["NODE_EXTRA_CA_CERTS", "DENO_CERT"] {
         vars.push((name.to_string(), ca.clone()));
     }
+    // Homebrew strips the CA variables from its environment but keeps the proxy ones, so its curl
+    // reaches the proxy and then rejects the certificate. Reading ~/.curlrc is its documented way
+    // back in; `write_curlrc` puts the bundle there.
+    if cfg!(target_os = "macos") {
+        vars.push(("HOMEBREW_CURLRC".to_string(), "1".to_string()));
+    }
     vars
+}
+
+const CURLRC_MARKER: &str = "# added by cicache";
+
+fn curlrc_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".curlrc"))
+}
+
+/// Points curl's own configuration at the bundle, for tools that sanitize the CA variables out of
+/// their environment before shelling out to it.
+fn write_curlrc(state: &State) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let Some(path) = curlrc_path() else {
+        return Ok(());
+    };
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains(CURLRC_MARKER) {
+        return Ok(());
+    }
+    let mut contents = existing;
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&format!(
+        "{CURLRC_MARKER}\ncacert = {}\n",
+        state.bundle_path.display()
+    ));
+    std::fs::write(&path, contents).context("writing ~/.curlrc")
+}
+
+/// Removes what `write_curlrc` added, leaving anything else in the file alone.
+fn clear_curlrc() {
+    let Some(path) = curlrc_path() else { return };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if !contents.contains(CURLRC_MARKER) {
+        return;
+    }
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.starts_with(CURLRC_MARKER) && !line.starts_with("cacert = "))
+        .collect();
+    let _ = if kept.iter().all(|line| line.trim().is_empty()) {
+        std::fs::remove_file(&path)
+    } else {
+        std::fs::write(&path, kept.join("\n") + "\n")
+    };
 }
 
 fn export_environment(state: &State, no_github_env: bool) -> Result<()> {
@@ -418,6 +477,7 @@ async fn stop(args: StopArgs) -> Result<()> {
         }
     }
 
+    clear_curlrc();
     let _ = std::fs::remove_dir_all(dir.join("objects"));
     let _ = std::fs::remove_file(state_path);
     Ok(())
