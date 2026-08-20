@@ -38,7 +38,7 @@ impl Ca {
         let key = KeyPair::generate().context("generating CA key")?;
 
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "cicache local CA");
+        dn.push(DnType::CommonName, crate::CA_COMMON_NAME);
         dn.push(DnType::OrganizationName, "cicache");
 
         let mut params = CertificateParams::default();
@@ -133,8 +133,12 @@ impl Ca {
             KeyUsagePurpose::KeyEncipherment,
         ];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        // Apple rejects server certificates whose validity exceeds 398 days as "not standards
+        // compliant", which takes down anything on macOS that verifies through the platform —
+        // rustup among them. Browsers enforce the same limit.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(300);
 
         let leaf = params
             .signed_by(&leaf_key, &self.cert, &self.key)

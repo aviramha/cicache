@@ -182,6 +182,7 @@ fn start(args: ProxyArgs) -> Result<()> {
     if let Err(err) = write_curlrc(&state) {
         println!("cicache: could not configure curl for Homebrew: {err:#}");
     }
+    install_system_trust(&state);
     export_environment(&state, args.no_github_env)?;
 
     println!(
@@ -267,7 +268,70 @@ fn environment(state: &State) -> Vec<(String, String)> {
     vars
 }
 
+/// Subject of the generated CA, used to find it again in the macOS keychain.
+pub const CA_COMMON_NAME: &str = "cicache local CA";
+
 const CURLRC_MARKER: &str = "# added by cicache";
+
+/// Whether modifying the machine's trust store is appropriate. Runners are disposable; a
+/// developer's laptop is not, so this stays out of the keychain outside CI.
+fn may_touch_system_trust() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os("GITHUB_ACTIONS").is_some()
+}
+
+/// Adds the CA to the macOS system keychain.
+///
+/// Anything verifying through the platform — rustup, and every Rust binary built against
+/// rustls-platform-verifier — reads the keychain and ignores the CA environment variables
+/// entirely, so this is the only way those tools can talk to the proxy.
+fn install_system_trust(state: &State) {
+    if !may_touch_system_trust() {
+        return;
+    }
+    let output = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "security",
+            "add-trusted-cert",
+            "-d",
+            "-r",
+            "trustRoot",
+            "-k",
+        ])
+        .arg("/Library/Keychains/System.keychain")
+        .arg(&state.ca_path)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => println!("cicache: added the CA to the system keychain"),
+        Ok(out) => println!(
+            "::warning title=cicache::could not add the CA to the system keychain: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(err) => println!("::warning title=cicache::could not run security(1): {err}"),
+    }
+}
+
+/// Undoes [`install_system_trust`].
+fn remove_system_trust(state: &State) {
+    if !may_touch_system_trust() {
+        return;
+    }
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "security", "remove-trusted-cert", "-d"])
+        .arg(&state.ca_path)
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "security",
+            "delete-certificate",
+            "-c",
+            CA_COMMON_NAME,
+            "-t",
+        ])
+        .arg("/Library/Keychains/System.keychain")
+        .output();
+}
 
 fn curlrc_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".curlrc"))
@@ -478,6 +542,7 @@ async fn stop(args: StopArgs) -> Result<()> {
     }
 
     clear_curlrc();
+    remove_system_trust(&state);
     let _ = std::fs::remove_dir_all(dir.join("objects"));
     let _ = std::fs::remove_file(state_path);
     Ok(())
