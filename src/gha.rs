@@ -12,6 +12,7 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const SERVICE: &str = "twirp/github.actions.results.api.v1.CacheService";
@@ -68,6 +69,10 @@ pub struct GhaCache {
     base: String,
     token: String,
     version: String,
+    /// Set once the service starts refusing calls. The cache API is rate limited per job, and a
+    /// build that fetches thousands of small objects will exhaust it; continuing to call costs a
+    /// round trip per request and returns nothing.
+    exhausted: AtomicBool,
 }
 
 impl GhaCache {
@@ -97,6 +102,7 @@ impl GhaCache {
             base,
             token,
             version: sha_hex(ENTRY_FORMAT_VERSION.as_bytes()),
+            exhausted: AtomicBool::new(false),
         })
     }
 
@@ -118,14 +124,31 @@ impl GhaCache {
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if !self.exhausted.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "cicache: the cache service is rate limiting this job; giving up on it for \
+                     the rest of the run. Raise --min-size so fewer, larger objects are stored."
+                );
+            }
+            return Err(anyhow!("{method} returned {status}: {text}"));
+        }
         if !status.is_success() {
             return Err(anyhow!("{method} returned {status}: {text}"));
         }
         serde_json::from_str(&text).with_context(|| format!("decoding {method} response: {text}"))
     }
 
+    /// Whether the service has started refusing calls for this job.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Relaxed)
+    }
+
     /// Fetches a previously stored object, or `None` if no entry matches.
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        if self.is_exhausted() {
+            return Ok(None);
+        }
         let req = DownloadRequest {
             key,
             version: &self.version,
@@ -151,6 +174,9 @@ impl GhaCache {
     /// Stores an object. Returns `false` when the service declines the reservation, which is the
     /// normal response when a concurrent job already wrote the same key.
     pub async fn put(&self, key: &str, data: Bytes) -> Result<bool> {
+        if self.is_exhausted() {
+            return Ok(false);
+        }
         let req = CreateRequest {
             key,
             version: &self.version,
