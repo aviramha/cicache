@@ -332,16 +332,13 @@ fn install_system_trust(state: &State) {
 }
 
 /// Undoes [`install_system_trust`].
-fn remove_system_trust(state: &State) {
+///
+/// Only `delete-certificate` is used. `remove-trusted-cert` blocks on an authorization the runner
+/// has no way to answer, and deleting the certificate takes it out of trust evaluation anyway.
+fn remove_system_trust(_state: &State) {
     if !may_touch_system_trust() {
         return;
     }
-    let mut remove = std::process::Command::new("sudo");
-    remove
-        .args(["-n", "security", "remove-trusted-cert", "-d"])
-        .arg(&state.ca_path);
-    run_bounded(&mut remove, KEYCHAIN_TIMEOUT);
-
     let mut delete = std::process::Command::new("sudo");
     delete
         .args([
@@ -353,10 +350,20 @@ fn remove_system_trust(state: &State) {
             "-t",
         ])
         .arg("/Library/Keychains/System.keychain");
-    run_bounded(&mut delete, KEYCHAIN_TIMEOUT);
+
+    if run_bounded(&mut delete, KEYCHAIN_TIMEOUT).is_none() {
+        // Runners are discarded after the job, so this only matters on a self-hosted one, where
+        // the certificate has to come out by hand.
+        println!(
+            "::warning title=cicache::could not remove \"{CA_COMMON_NAME}\" from the system \
+             keychain; on a self-hosted runner, delete it manually"
+        );
+    }
 }
 
-const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Short on purpose: these calls take well under a second when they work, and when they do not
+/// they block until killed. The teardown step is not worth spending a job's time on.
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs a command to completion, killing it if it outlives `limit`.
 ///
